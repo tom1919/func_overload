@@ -200,7 +200,7 @@ class Opt(BaseModel):
             raise NotImplementedError(f"opt_kind ='{kind}' is not supported")
     
     @_register_handler('max_alpha')
-    def max_alpha(rtn, sigma, exposure, risk, bmrk, constraints):
+    def _max_alpha(rtn, sigma, exposure, risk, bmrk, constraints):
         bm_wt = rtn.copy()
         bm_wt['wt'] = np.where(bm_wt.ticker == bmrk, 1, 0)
         risk_limit = bm_wt.wt @ sigma @ bm_wt.wt
@@ -209,7 +209,7 @@ class Opt(BaseModel):
         return objective, constraints
         
     @_register_handler('min_risk')
-    def min_risk(rtn, sigma, exposure, risk, bmrk, constraints):   
+    def _min_risk(rtn, sigma, exposure, risk, bmrk, constraints):   
         r = rtn.copy()
         exp_limit = r.loc[r.ticker == bmrk, 'yhat'].values[0]
         constraints.append(exposure >= exp_limit)
