@@ -65,9 +65,6 @@ class HandlerFactory:
         self.data = data
         self.kind = kind
     
-    def sub(string):
-        return re.sub('__.+__.', '', string)
-    
     def write_kind(self):
         subclasses = FileHandler.__subclasses__()
         pattern = "<class '__.+__.(.+)'>"
