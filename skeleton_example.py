@@ -55,6 +55,46 @@ class ExcelHandler(FileHandler):
 handler = HandlerFactory.get_handler("txt")
 handler.write("dummy-data")
 
+#%%
+
+import re
+from abc import ABC, abstractmethod
+
+class HandlerFactory:
+    def __init__(self, data, kind):
+        self.data = data
+        self.kind = kind
+    
+    def sub(string):
+        return re.sub('__.+__.', '', string)
+    
+    def write_kind(self):
+        subclasses = FileHandler.__subclasses__()
+        pattern = "<class '__.+__.(.+)'>"
+        str_subclasses = map(lambda x: re.search(pattern, str(x)).group(1), 
+                             subclasses)
+        try:
+            i = list(str_subclasses).index(self.kind)
+        except ValueError:
+            raise NotImplementedError(f"'kind = {self.kind}' is not supported")
+        subclasses[i].write(self)
+
+class FileHandler(ABC):
+  @abstractmethod
+  def write(self):
+    raise NotImplementedError
+    
+class CSVHandler(FileHandler):
+  def write(self):
+    # Some implementation to write data out as CSV
+    print("Successfully wrote to CSV!")
+
+class JSONHandler(FileHandler):
+  def write(self):
+    # Some implementation to write data out as JSON
+    print("Successfully wrote to JSON!")
+    
+HandlerFactory('dummy-data', 'CSVHandler').write_kind()
 
 #%%
 
