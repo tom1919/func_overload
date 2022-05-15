@@ -9,12 +9,14 @@ Class for optimizing portfolio weights
 
 #%% libs
 
+import re
 import logging
 import cvxpy as cp
 import numpy as np
 import pandas as pd
 from .utils import todate
-from pydantic import BaseModel
+from abc import ABC, abstractmethod
+from pydantic import BaseModel, PrivateAttr
 
 #%% opt 
 
@@ -28,8 +30,8 @@ class Opt(BaseModel):
         yhat column is the forecasted ranking of returns for each ticker.
     cov : pd.DataFrame
         covariance matrix for the tickers.
-    lg : logging.logger
-        logger used for warnings
+    cur_wts : pd.DataFrame
+        current weights used to constrain turnover.
     benchmark : str, optional
         the benchmark ticker. The default is 'SPY'.
     opt_kind : str, optional
@@ -51,21 +53,30 @@ class Opt(BaseModel):
         the solver that CVXPY uses. The default is 'XPRESS'.
     verbose : bool, optional
         print optimization info. The default is True.
+    lg : logging.logger
+        logger used for warnings
     '''
     
     rtn: pd.core.frame.DataFrame 
     cov: pd.core.frame.DataFrame 
-    lg: logging.Logger
+    cur_wts: pd.core.frame.DataFrame = None
     benchmark = 'SPY' 
-    opt_kind = 'max_alpha'
+    opt_kind = 'MaxAlpha'
     bm_min = .8 
     max_wt = .05  
     max_cash_wt = .07
     min_nonzero_wt = .01 
     solver = 'XPRESS' 
     verbose = False
-    sol_meta = {} #TODO: use _sol_meta
-    _handlers = {} #TODO clean up function factory
+    lg: logging.Logger = None
+    
+    _w: cp.expressions.variable.Variable = PrivateAttr()
+    _b: cp.expressions.variable.Variable = PrivateAttr()
+    _alpha: cp.atoms.affine.binary_operators.MulExpression = PrivateAttr()
+    _risk: cp.affine.binary_operators.MulExpression = PrivateAttr()
+    _alpha_limit: float = PrivateAttr()
+    _risk_limit: float = PrivateAttr()
+    _constraints: list = PrivateAttr()
 
     class Config:
         arbitrary_types_allowed = True
@@ -81,16 +92,19 @@ class Opt(BaseModel):
         sol_meta : dict
             the exposure, risk of the opt wts and limits for exposure/risk used.
         '''
+        self._add_logger()
         self.rtn, self.cov = self._conform_opt_inputs()
-        prob = self._define_prob()
+        self._base_variables()
+        self._base_constraints()
+        subclass = self._get_subclass('opt_kind')
+        prob, self = subclass._define_prob(self)
         prob.solve(verbose = self.verbose, solver = self.solver)
-        sol_meta = self.sol_meta.copy()
-        sol_meta['exposure'] = sol_meta['exposure'].value[0]
-        sol_meta['risk'] = sol_meta['risk'].value
-        opt = self.rtn.copy()
-        opt['wt'] = prob.variables()[0].value
-        opt = opt.sort_values('yhat')
-        return opt, sol_meta
+ 
+    
+    def _add_logger(self):
+        if self.lg is None:
+            from thelogger import lg
+            self.lg = lg
 
     def _conform_opt_inputs(self):
         '''
@@ -125,93 +139,114 @@ class Opt(BaseModel):
         
         return rtn2, cov2 
 
-    def _define_prob(self, _handlers = _handlers):
-        '''
-        Defines and returns a cvxpy Problem instance
-        '''
-        
-        r = self.rtn.copy()
-        alpha = self.rtn.yhat.to_numpy().reshape([len(r), 1])
+    def _base_variables(self):
+        n  = len(self.rtn)
+        self._w, self._b = cp.Variable(n), cp.Variable(n, boolean=True) 
+        mu = self.rtn.yhat.to_numpy().reshape([n, 1])
+        self._alpha = mu.T @ self._w
         sigma = self.cov.to_numpy()
-            
-        w, b = cp.Variable(len(r)), cp.Variable(len(r), boolean=True)  
-        constraints = self._base_constraints(w, b)
-        
-        risk_limit, exp_limit = None, None
-        exposure, risk = alpha.T @ w, cp.quad_form(w, sigma)
-                
-        objective, constraints = self._get_opt_kind(sigma, exposure, risk, 
-                                                    constraints, _handlers)
-        
-        prob = cp.Problem(objective, constraints)
-        
-        self.sol_meta = {'exposure': exposure, 'risk': risk,
-                          'exp_limit': exp_limit, 'risk_limit': risk_limit}
+        self._risk = cp.quad_form(self._w, sigma)
 
-        return prob
-
-    def _base_constraints(self, w, b):
+    def _base_constraints(self):
         '''
         Constraints that are commom to the different kinds of optimizations
     
-        Parameters
-        ----------
-        w : cvxpy.Variable
-            weights to be optimized.
+        Notes
+        -----
         b : cvxpy.Variable
             binary variable used to constrain non-zero weights to be greater 
             than a specified amount. cvxpy doesn't support semi-continuous vars, 
             and this approach for defining the constraint makes this a MIQP
-    
-        Returns
-        -------
-        constraints : list
-            list of the base constraints.
-    
         '''
         
+        w = self._w
+        b = self._b
         r = self.rtn
-        n = w.shape[0]
+        n  = len(r)
+        
         min_wts = np.where(r.ticker == self.benchmark, self.bm_min, 0)
         max_wts = np.where(r.ticker == self.benchmark, 1, self.max_wt)
         max_wts = np.where(r.ticker == 'cash', self.max_cash_wt, max_wts)
         
-        constraints = [cp.sum(w) == 1,
-                       w >= min_wts,
-                       w <= max_wts,
-                       w >= cp.multiply(b, np.ones(n) * self.min_nonzero_wt),
-                       w <= cp.multiply(b, np.ones(n))
-                       ]
+        c = [
+            cp.sum(w) == 1,
+            w >= min_wts,
+            w <= max_wts,
+            w >= cp.multiply(b, np.ones(n) * self.min_nonzero_wt),
+            w <= cp.multiply(b, np.ones(n))
+            ]
         
-        return constraints
+        self._constraints = c
 
-    def _register_handler(kind, _handlers = _handlers):
-        def _wrapper(fn):
-            _handlers[kind] = fn
-            return fn
-        return _wrapper
-    
-    def _get_opt_kind(self, sigma, exposure, risk, constraints, _handlers):
-        rtn, bmrk, kind = self.rtn, self.benchmark, self.opt_kind
-        try:
-            return _handlers[kind](rtn, sigma, exposure, risk, bmrk, 
-                                   constraints)
-        except KeyError:
-            raise NotImplementedError(f"opt_kind ='{kind}' is not supported")
-    
-    @_register_handler('max_alpha')
-    def _max_alpha(rtn, sigma, exposure, risk, bmrk, constraints):
-        bm_wt = rtn.copy()
-        bm_wt['wt'] = np.where(bm_wt.ticker == bmrk, 1, 0)
-        risk_limit = bm_wt.wt @ sigma @ bm_wt.wt
-        constraints.append(risk <= risk_limit)
-        objective = cp.Maximize(exposure)
-        return objective, constraints
+    def _get_subclass(self, str_keyword):
         
-    @_register_handler('min_risk')
-    def _min_risk(rtn, sigma, exposure, risk, bmrk, constraints):   
-        r = rtn.copy()
-        exp_limit = r.loc[r.ticker == bmrk, 'yhat'].values[0]
-        constraints.append(exposure >= exp_limit)
-        objective = cp.Minimize(risk)
-        return objective, constraints  
+        subclasses = _Interface.__subclasses__()
+        pattern = "<class '__.+__._(.+)'>"
+        str_subclasses = list(map(lambda x: re.search(pattern, str(x)).group(1), 
+                                  subclasses))
+        
+        kind = getattr(self, str_keyword)
+        try:
+            str_subclasses = list(str_subclasses)
+            i = str_subclasses.index(kind)
+        except ValueError:
+            err_msg = f"'valid args for {str_keyword} are: {str_subclasses}"
+            raise NotImplementedError(err_msg)
+            
+        subclass = subclasses[i]   
+        
+        return subclass
+    
+    @property
+    def weights(self):
+        return self._w.value
+    
+    @property
+    def alpha(self):
+        return self._alpha.value[0]
+    
+    @property
+    def risk(self):
+        return self._risk.value
+    
+    @property
+    def alpha_limit(self):
+        return self._alpha_limit
+    
+    @property
+    def risk_limit(self):
+        return self._risk_limit
+    
+#%%
+
+class _Interface(ABC):
+    @abstractmethod
+    def _define_prob(self):
+        raise NotImplementedError
+        
+class _MaxAlpha(_Interface):
+    
+    def _define_prob(self):
+        
+        bm_wt = self.rtn.copy()
+        bm_wt['wt'] = np.where(bm_wt.ticker == self.benchmark, 1, 0)
+        self._risk_limit = bm_wt.wt @ self.cov.to_numpy() @ bm_wt.wt
+        
+        self._constraints.append(self._risk <= self._risk_limit)
+        objective = cp.Maximize(self._alpha)
+        prob = cp.Problem(objective, self._constraints)
+        
+        return prob, self
+
+class _MinRisk(_Interface):
+    
+    def _define_prob(self):
+        
+        benchmark = self.rtn.ticker == self.benchmark
+        self._alpha_limit = self.rtn.loc[benchmark, 'yhat'].values[0]
+        self._constraints.append(self._alpha >= self._alpha_limit)
+        
+        objective = cp.Minimize(self._risk)
+        prob = cp.Problem(objective, self._constraints)
+        
+        return prob, self
